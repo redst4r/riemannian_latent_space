@@ -1,6 +1,8 @@
 import numpy as np
 import tensorflow as tf
 import tqdm
+import networkx as nx
+from sklearn.neighbors import NearestNeighbors
 
 """
 along the lines of 
@@ -85,81 +87,49 @@ class RiemannianMetric(object):
 
 class RiemannianTree(object):
     """docstring for RiemannianTree"""
+
     def __init__(self, riemann_metric):
         super(RiemannianTree, self).__init__()
         self.riemann_metric = riemann_metric  # decoder input (tf_variable)
 
-    def create_nn_graph(self, encoded_x, n_steps, n_neighbors):
-        """
-        nearst neightoburs in latent space
-        (still based on euclidean distance in latent space!!)
 
-        but puts the riemannian distance on the edges of nearest neightbours
-        """
-        from sklearn.neighbors import NearestNeighbors
-        n_data = len(encoded_x)
+    def create_riemannian_graph(self, z, n_steps, n_neighbors):
+
+        n_data = len(z)
         knn = NearestNeighbors(n_neighbors=n_neighbors, metric='euclidean')
-        knn.fit(encoded_x)
+        knn.fit(z)
 
-        # now, for each datapoint and nearest neightoburs,
-        # calculate the Riemannian distance and the heuristic
-        # distance for the A*-algorithm
+        G = nx.Graph()
 
-        riemannian_matrix = np.full([n_data, n_data], np.inf)
-        heuristic_matrix = np.full([n_data, n_data], np.inf)
+        # Nodes
+        for i in range(n_data):
+            n_attr = {f'z{k}': float(z[i, k]) for k in range(z.shape[1])}
+            G.add_node(i, **n_attr)
+
+        # edges
         for i in tqdm.trange(n_data):
-            z = encoded_x[i:i+1]
-
-            distances, indices = knn.kneighbors(z)
-
+            distances, indices = knn.kneighbors(z[i:i+1])
             # first dim is for samples (z), but we only have one
             distances = distances[0]
             indices = indices[0]
+
             for ix, dist in zip(indices, distances):
-                # calculate the riemannian distance of z and its nn
+                # calculate the riemannian distance of z[i] and its nn
 
                 # save some computation if we alrdy calculated the other direction
-                if riemannian_matrix[i, ix] != np.inf or riemannian_matrix[ix, i] != np.inf:
+                if (i, ix) in G.edges or (ix, i) in G.edges or i == ix:
                     continue
 
-                L_riemann = self.riemann_metric.riemannian_distance_along_line(z, encoded_x[ix], n_steps=n_steps)
-                L_heuristic = dist
+                L_riemann = self.riemann_metric.riemannian_distance_along_line(z[i:i+1], z[ix:ix+1], n_steps=n_steps)
+                L_euclidean = dist
 
-                riemannian_matrix[i, ix] = L_riemann
-                heuristic_matrix[i, ix] = L_heuristic
-
-                # Note that NN are not symmetric, but lets make the matrix symmetric
-                riemannian_matrix[ix, i] = L_riemann
-                heuristic_matrix[ix, i] = L_heuristic
-        # TODO: not sure if the heutrisitc matrix should contain inf!!
-        # maybe just euclidean distance of all-vs-all
-        return riemannian_matrix, heuristic_matrix
-
-    def create_nx_graph(self, encoded_x, n_steps, n_neighbors):
-        A, B  = self.create_nn_graph(encoded_x, n_steps, n_neighbors)
-
-        def _prep_network(A):
-            # in networkx, the floats are edge weights, i.e. the larger the stronger connected
-            # but my floats are distances
-            weights = 1/A
-            weights[weights==np.inf] = 0
-            import networkx as nx
-            G = nx.Graph(weights)
-
-            for i in range(len(encoded_x)):
-                G.nodes[i]['z1'] = float(encoded_x[i,0])
-                G.nodes[i]['z2'] = float(encoded_x[i,1])
-                G.nodes[i]['label'] = str(i)
-
-            for n1,n2 in G.edges:
-                G.edges[n1,n2]['distance'] = float(A[n1,n2])
-
-            return G
-
-        G_riemann = _prep_network(A)
-        G_euclidean = _prep_network(B)
-
-        return G_riemann, G_euclidean
+                # note nn-distances are NOT symmetric
+                edge_attr = {'weight': float(1/L_riemann),
+                             'weight_euclidean': float(1/L_euclidean),
+                             'distance_riemann': float(L_riemann),
+                             'distance_euclidean': float(L_euclidean)}
+                G.add_edge(i, ix, **edge_attr)
+        return G
 
 
 
@@ -216,15 +186,9 @@ def main():
 
     rTree = RiemannianTree(rmetric)
 
-    A, B = rTree.create_nn_graph(z, n_steps=1000, n_neighbors=10)
+    G = rTree.create_riemannian_graph(z, n_steps=1000, n_neighbors=10)
 
-    #ahoertest path finding
-    # for nx a non-existing edge should be 0 weight
-    A = 1/A
-    A[A==np.inf] = 0
-    import networkx as nx
-    G = nx.Graph(A)
-
+    # can use G to do shortest path finding now
 
 if __name__ == '__main__':
     main()
