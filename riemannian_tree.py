@@ -29,6 +29,8 @@ class RiemannianMetric(object):
         # derivative of each output dim wrt to input (tf.gradients would sum over the output)
         J = [tf.gradients(self.x[:, _], self.z)[0] for _ in range(output_dim)]
         J = tf.stack(J, axis=1)  # batch x output x latent
+        self.J = J
+
         G = tf.transpose(J, [0, 2, 1]) @ J  # J^T \cdot J
         self.G = G
 
@@ -91,6 +93,8 @@ class RiemannianTree(object):
         """
         nearst neightoburs in latent space
         (still based on euclidean distance in latent space!!)
+
+        but puts the riemannian distance on the edges of nearest neightbours
         """
         from sklearn.neighbors import NearestNeighbors
         n_data = len(encoded_x)
@@ -132,15 +136,31 @@ class RiemannianTree(object):
         return riemannian_matrix, heuristic_matrix
 
     def create_nx_graph(self, encoded_x, n_steps, n_neighbors):
-        A,_  = self.create_nn_graph(encoded_x, n_steps, n_neighbors)
-        # A[A==np.inf] = 0
-        # in networkx, the floats are edge weights, i.e. the larger the stronger connected
-        # but my floats are distances
-        A = 1/A
-        A[A==np.inf] = 0
-        import networkx as nx
-        G = nx.Graph(A)
-        return G
+        A, B  = self.create_nn_graph(encoded_x, n_steps, n_neighbors)
+
+        def _prep_network(A):
+            # in networkx, the floats are edge weights, i.e. the larger the stronger connected
+            # but my floats are distances
+            weights = 1/A
+            weights[weights==np.inf] = 0
+            import networkx as nx
+            G = nx.Graph(weights)
+
+            for i in range(len(encoded_x)):
+                G.nodes[i]['z1'] = float(encoded_x[i,0])
+                G.nodes[i]['z2'] = float(encoded_x[i,1])
+                G.nodes[i]['label'] = str(i)
+
+            for n1,n2 in G.edges:
+                G.edges[n1,n2]['distance'] = float(A[n1,n2])
+
+            return G
+
+        G_riemann = _prep_network(A)
+        G_euclidean = _prep_network(B)
+
+        return G_riemann, G_euclidean
+
 
 
 def main():
@@ -204,130 +224,6 @@ def main():
     A[A==np.inf] = 0
     import networkx as nx
     G = nx.Graph(A)
-
-
-
-
-""" generic A-Star path searching algorithm """
-
-from abc import ABCMeta, abstractmethod
-from heapq import heappush, heappop
-Infinite = float('inf')
-class AStar:
-    __metaclass__ = ABCMeta
-    __slots__ = ()
-
-    class SearchNode:
-        __slots__ = ('data', 'gscore', 'fscore',
-                     'closed', 'came_from', 'out_openset')
-
-        def __init__(self, data, gscore=Infinite, fscore=Infinite):
-            self.data = data
-            self.gscore = gscore
-            self.fscore = fscore
-            self.closed = False
-            self.out_openset = True
-            self.came_from = None
-
-        def __lt__(self, b):
-            return self.fscore < b.fscore
-
-    class SearchNodeDict(dict):
-
-        def __missing__(self, k):
-            v = AStar.SearchNode(k)
-            self.__setitem__(k, v)
-            return v
-
-    @abstractmethod
-    def heuristic_cost_estimate(self, current, goal):
-        """Computes the estimated (rough) distance between a node and the goal, this method must be implemented in a subclass. The second parameter is always the goal."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def distance_between(self, n1, n2):
-        """Gives the real distance between two adjacent nodes n1 and n2 (i.e n2 belongs to the list of n1's neighbors).
-           n2 is guaranteed to belong to the list returned by the call to neighbors(n1).
-           This method must be implemented in a subclass."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def neighbors(self, node):
-        """For a given node, returns (or yields) the list of its neighbors. this method must be implemented in a subclass"""
-        raise NotImplementedError
-
-    def is_goal_reached(self, current, goal):
-        """ returns true when we can consider that 'current' is the goal"""
-        return current == goal
-
-    def reconstruct_path(self, last, reversePath=False):
-        def _gen():
-            current = last
-            while current:
-                yield current.data
-                current = current.came_from
-        if reversePath:
-            return _gen()
-        else:
-            return reversed(list(_gen()))
-
-    def astar(self, start, goal, reversePath=False):
-        if self.is_goal_reached(start, goal):
-            return [start]
-        searchNodes = AStar.SearchNodeDict()
-        startNode = searchNodes[start] = AStar.SearchNode(
-            start, gscore=.0, fscore=self.heuristic_cost_estimate(start, goal))
-        openSet = []
-        heappush(openSet, startNode)
-        while openSet:
-            current = heappop(openSet)
-            if self.is_goal_reached(current.data, goal):
-                return self.reconstruct_path(current, reversePath)
-            current.out_openset = True
-            current.closed = True
-            for neighbor in [searchNodes[n] for n in self.neighbors(current.data)]:
-                if neighbor.closed:
-                    continue
-                tentative_gscore = current.gscore + \
-                    self.distance_between(current.data, neighbor.data)
-                if tentative_gscore >= neighbor.gscore:
-                    continue
-                neighbor.came_from = current
-                neighbor.gscore = tentative_gscore
-                neighbor.fscore = tentative_gscore + \
-                    self.heuristic_cost_estimate(neighbor.data, goal)
-                if neighbor.out_openset:
-                    neighbor.out_openset = False
-                    heappush(openSet, neighbor)
-        return None
-
-
-class RiemannAStar(AStar):
-
-    """"""
-
-    def __init__(self, maze):
-        self.lines = maze.strip().split('\n')
-        self.width = len(self.lines[0])
-        self.height = len(self.lines)
-
-    def heuristic_cost_estimate(self, n1, n2):
-        """computes the 'direct' distance between two (x,y) tuples"""
-        (x1, y1) = n1
-        (x2, y2) = n2
-        return math.hypot(x2 - x1, y2 - y1)
-
-    def distance_between(self, n1, n2):
-        """this method always returns 1, as two 'neighbors' are always adajcent"""
-        return 1
-
-    def neighbors(self, node):
-        """ for a given coordinate in the maze, returns up to 4 adjacent(north,east,south,west)
-            nodes that can be reached (=any adjacent coordinate that is not a wall)
-        """
-        x, y = node
-        return[(nx, ny) for nx, ny in[(x, y - 1), (x, y + 1), (x - 1, y), (x + 1, y)]if 0 <= nx < self.width and 0 <= ny < self.height and self.lines[ny][nx] == ' ']
-
 
 
 if __name__ == '__main__':
